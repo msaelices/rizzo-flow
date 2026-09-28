@@ -81,7 +81,7 @@ def main():
         p = commands.add_parser(name)
         p.add_argument("--size", choices=tuple(MODELS), default=DEFAULT_SIZE)
         p.add_argument("--backend", choices=BACKENDS, default="llama")
-        p.add_argument("--model", type=Path, help="GGUF file (MLX: checkpoint directory)")
+        p.add_argument("--model", type=Path, help="GGUF file (MLX, MAX: checkpoint directory)")
         p.add_argument("--quant", choices=QUANTS, help=f"Pinned GGUF file; default {DEFAULT_QUANT}")
         p.add_argument(
             "--weights",
@@ -127,7 +127,8 @@ def main():
     args = parser.parse_args()
     try:
         if args.command == "download":
-            if args.backend == "mlx":
+            # MLX and MAX load the same BF16 safetensors checkpoint.
+            if args.backend in ("mlx", "max"):
                 print(download_model(args.destination, args.size, args.weights))
                 return
             if args.only != "weights":
