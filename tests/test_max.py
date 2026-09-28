@@ -69,7 +69,7 @@ def backend(reference):
     class Tokenizer:
         pad_token_id = 0
 
-    runner = SparkRunner(SparkConfig.from_hf(config), weights, CPU(), DType.float32)
+    runner = SparkRunner(SparkConfig.from_hf(config), weights, CPU(), DType.float32, batch_size=3)
     return MaxBackend(runner, Tokenizer(), {}, batch_size=3, prefill_chunk=7)
 
 

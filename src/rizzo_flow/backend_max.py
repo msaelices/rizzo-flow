@@ -90,7 +90,8 @@ def describe() -> dict:
 class SparkRunner:
     """The two compiled graphs and the device buffers they exchange."""
 
-    def __init__(self, config: SparkConfig, weights, device, dtype):
+    def __init__(self, config: SparkConfig, weights, device, dtype, batch_size=4):
+        from max.driver import CPU
         from max.dtype import DType
         from max.engine import InferenceSession
         from max.graph import DeviceRef
@@ -111,18 +112,49 @@ class SparkRunner:
                 raise ValueError(f"{name} has shape {found}, the config implies {shape}")
             if kind != dtype:
                 raise ValueError(f"{name} is {kind}, the graphs expect {dtype}")
-        # Uploaded once and passed to both graphs on every call.
-        self._weights = [self._buffer(weights[name]) for name in graphs.weight_shapes()]
+        # Uploaded once and passed to both graphs on every call. Fused projections are
+        # concatenated on the host first, so the device never holds the separate halves.
+        host = CPU()
+        concat = InferenceSession(devices=[host]).load(
+            self._concat_graph(DeviceRef.from_device(host))
+        )
+        self._weights = []
+        for key, (names, _) in graphs.input_shapes().items():
+            if len(names) == 1:
+                buffer = self._host_buffer(weights[names[0]])
+            else:
+                buffer = concat.execute(*[self._host_buffer(weights[name]) for name in names])[0]
+            if graphs.weight_device(key).is_gpu():
+                buffer = buffer.to(device)
+            self._weights.append(buffer)
         session = InferenceSession(devices=[device])
         self._prefill = session.load(graphs.prefill())
-        self._score = session.load(graphs.score())
+        # Score graphs have a static batch: one row for lone questions and `direct` mode, and
+        # `batch_size` rows for microbatches, smaller groups padded with copies.
+        self.batch_size = batch_size
+        self._score = {1: session.load(graphs.score(1))}
+        if batch_size > 1:
+            self._score[batch_size] = session.load(graphs.score(batch_size))
 
-    def _buffer(self, array):
+    def _concat_graph(self, device):
+        from max.graph import Graph, TensorType, ops
+
+        hidden = self.config.hidden_size
+        types = [TensorType(self.dtype, [rows, hidden], device=device) for rows in ("A", "B")]
+        with Graph("spark_fuse", input_types=types) as graph:
+            graph.output(ops.concat([v.tensor for v in graph.inputs], axis=0))
+        return graph
+
+    @staticmethod
+    def _host_buffer(array):
         from max.driver import Buffer
 
         if isinstance(array, np.ndarray):
-            return Buffer.from_numpy(np.ascontiguousarray(array)).to(self.device)
-        return Buffer.from_dlpack(array).to(self.device)  # safetensors WeightData (BF16)
+            return Buffer.from_numpy(np.ascontiguousarray(array))
+        return Buffer.from_dlpack(array)  # safetensors WeightData (BF16)
+
+    def _buffer(self, array):
+        return self._host_buffer(array).to(self.device)
 
     def empty_cache(self):
         from max.driver import Buffer
@@ -137,7 +169,7 @@ class SparkRunner:
         for start in range(0, len(tokens), chunk):
             piece = tokens[start : start + chunk]
             cache = self._prefill.execute(
-                self._buffer(np.array(piece, dtype=np.int64)),
+                self._host_buffer(np.array(piece, dtype=np.int64)),
                 self._buffer(np.arange(start, start + len(piece), dtype=np.int64)),
                 self._buffer(np.arange(start, dtype=np.int64)),
                 *cache,
@@ -147,24 +179,29 @@ class SparkRunner:
 
     def score(self, cache, prefix_length, suffixes, slots, pad):
         """fp32 logits [len(suffixes), len(slots)] after each suffix, all continuing `cache`."""
-        width = max(map(len, suffixes))
-        tokens = np.full((len(suffixes), width), pad, dtype=np.int64)
-        for row, suffix in enumerate(suffixes):
+        count = len(suffixes)
+        if not 1 <= count <= self.batch_size:
+            raise ValueError(f"score takes 1 to {self.batch_size} suffixes")
+        batch = 1 if count == 1 else self.batch_size
+        rows = suffixes + [suffixes[0]] * (batch - count)  # padding rows, discarded
+        width = max(map(len, rows))
+        tokens = np.full((len(rows), width), pad, dtype=np.int64)
+        for row, suffix in enumerate(rows):
             tokens[row, : len(suffix)] = suffix
         # Right padding is causal future context: each row reads its own last real position.
-        last = np.array([r * width + len(s) - 1 for r, s in enumerate(suffixes)], dtype=np.int64)
-        (logits,) = self._score.execute(
-            self._buffer(tokens),
+        last = np.array([r * width + len(s) - 1 for r, s in enumerate(rows)], dtype=np.int64)
+        (logits,) = self._score[batch].execute(
+            self._host_buffer(tokens),
             self._buffer(np.arange(prefix_length, prefix_length + width, dtype=np.int64)),
             self._buffer(last),
-            self._buffer(np.array(slots, dtype=np.int64)),
+            self._host_buffer(np.array(slots, dtype=np.int64)),
             self._buffer(np.arange(prefix_length, dtype=np.int64)),
             *cache,
             *self._weights,
         )
         from max.driver import CPU
 
-        return logits.to(CPU()).to_numpy()
+        return logits.to(CPU()).to_numpy()[:count]
 
     def free_bytes(self):
         if self.device.is_host:
@@ -205,7 +242,7 @@ class MaxBackend:
         spec = identify(config)
         weights = load_weights(sorted(path.glob("*.safetensors")))
         registry = {name: weight.data() for name, weight in weights.items()}
-        runner = SparkRunner(spark, registry, target, DType.bfloat16)
+        runner = SparkRunner(spark, registry, target, DType.bfloat16, batch_size)
         identity = {
             "source": spec.repo,
             "requested_revision": spec.revision,
