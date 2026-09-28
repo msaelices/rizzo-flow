@@ -79,6 +79,37 @@ def quantiles(values):
     return {"p50": pick(0.5), "p95": pick(0.95), "min": ordered[0], "mean": statistics.mean(values)}
 
 
+def measure(engine, payload, tokens, count, mode, repeats):
+    first = engine.decide(payload)  # warm-up, also the recorded answers
+    seconds, inference, prefill = [], [], []
+    for _ in range(repeats):
+        mark = time.perf_counter()
+        response = engine.decide(payload)
+        seconds.append(time.perf_counter() - mark)
+        inference.append(response["timing"]["inference_seconds"])
+        prefill.append(response["timing"]["prefill_seconds"])
+    timing = response["timing"]
+    return {
+        "state_tokens": tokens,
+        "questions": count,
+        "mode": mode,
+        "input_tokens": timing["logical_input_tokens"],
+        "shared_prefix_tokens": timing["shared_prefix_tokens"],
+        "seconds": quantiles(seconds),
+        "inference_seconds": quantiles(inference),
+        "prefill_seconds": quantiles(prefill),
+        "decisions_per_second": count / statistics.median(seconds),
+        "peak_device_bytes": timing.get("peak_device_bytes"),
+        "answers": {
+            key: {
+                "prompt_sha256": answer["prompt_sha256"],
+                "probabilities": answer["probabilities"],
+            }
+            for key, answer in first["answers"].items()
+        },
+    }
+
+
 def run(args):
     from rizzo_flow.engine import Engine
     from rizzo_flow.loader import load_backend
@@ -109,34 +140,15 @@ def run(args):
             for count in args.questions:
                 for mode in args.modes:
                     payload = {**request(tokens, count), "mode": mode}
-                    first = engine.decide(payload)  # warm-up, also the recorded answers
-                    seconds, inference, prefill = [], [], []
-                    for _ in range(args.repeats):
-                        mark = time.perf_counter()
-                        response = engine.decide(payload)
-                        seconds.append(time.perf_counter() - mark)
-                        inference.append(response["timing"]["inference_seconds"])
-                        prefill.append(response["timing"]["prefill_seconds"])
-                    timing = response["timing"]
-                    cell = {
-                        "state_tokens": tokens,
-                        "questions": count,
-                        "mode": mode,
-                        "input_tokens": timing["logical_input_tokens"],
-                        "shared_prefix_tokens": timing["shared_prefix_tokens"],
-                        "seconds": quantiles(seconds),
-                        "inference_seconds": quantiles(inference),
-                        "prefill_seconds": quantiles(prefill),
-                        "decisions_per_second": count / statistics.median(seconds),
-                        "peak_device_bytes": timing.get("peak_device_bytes"),
-                        "answers": {
-                            key: {
-                                "prompt_sha256": answer["prompt_sha256"],
-                                "probabilities": answer["probabilities"],
-                            }
-                            for key, answer in first["answers"].items()
-                        },
-                    }
+                    try:
+                        cell = measure(engine, payload, tokens, count, mode, args.repeats)
+                    except (ValueError, RuntimeError) as error:
+                        # Out of device memory, typically: record it and keep the other cells.
+                        cell = {"state_tokens": tokens, "questions": count, "mode": mode}
+                        cell["error"] = str(error).splitlines()[0]
+                        report["cells"].append(cell)
+                        print(f"{tokens:>6} tok × {count:>3} q {mode:>6}: {cell['error']}")
+                        continue
                     report["cells"].append(cell)
                     print(
                         f"{tokens:>6} tok × {count:>3} q {mode:>6}: "
@@ -168,6 +180,13 @@ def compare(args):
         other = right.get(key(cell))
         if other is None:
             continue
+        if "error" in cell or "error" in other:
+            failed = "A" if "error" in cell else "B"
+            print(
+                f"| {cell['state_tokens']} state | {cell['questions']} | {cell['mode']} "
+                f"| {failed} failed: {(cell.get('error') or other['error'])[:60]} |"
+            )
+            continue
         changes, delta = 0, 0.0
         for q, answer in cell["answers"].items():
             twin = other["answers"][q]
@@ -184,7 +203,7 @@ def compare(args):
             f"| {changes}/{len(cell['answers'])} | {delta:.4f} |"
         )
     for label, report in (("A", a), ("B", b)):
-        peaks = [c["peak_device_bytes"] for c in report["cells"] if c["peak_device_bytes"]]
+        peaks = [c["peak_device_bytes"] for c in report["cells"] if c.get("peak_device_bytes")]
         if peaks:
             print(f"\n{label} peak device memory: {max(peaks) / 2**30:.2f} GiB")
 
