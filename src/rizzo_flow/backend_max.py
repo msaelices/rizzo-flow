@@ -68,6 +68,21 @@ def pick_device(device="auto"):
     return CPU()
 
 
+def describe() -> dict:
+    """The MAX section of `rizzo devices`; ImportError without the max extra."""
+    from max.driver import Accelerator, accelerator_count
+
+    accelerators = [Accelerator(i) for i in range(accelerator_count())]
+    return {
+        "installed": importlib.metadata.version("max"),
+        "devices": [
+            {"api": d.api, "architecture": d.architecture_name, "memory": d.stats["total_memory"]}
+            for d in accelerators
+        ],
+        "auto_selects": "gpu" if accelerators else "cpu",
+    }
+
+
 class SparkRunner:
     """The two compiled graphs and the device buffers they exchange."""
 
@@ -189,7 +204,7 @@ class MaxBackend:
         metadata = {
             **identity,
             "fingerprint": hashlib.sha256(canonical(identity).encode()).hexdigest(),
-            "device_name": None if target.is_host else target.label,
+            "device_name": None if target.is_host else target.architecture_name,
             "load_seconds": time.perf_counter() - started,
         }
         return cls(runner, MaxTokenizer(path), metadata, batch_size, prefill_chunk, idle_free)

@@ -93,7 +93,7 @@ def load_backend(
 
 
 def describe() -> dict:
-    """What `rizzo devices` prints: the llama.cpp runtime and its devices, and MLX if present."""
+    """What `rizzo devices` prints: the llama.cpp runtime and its devices, MLX and MAX if present."""
     from . import llama_release
     from .llama_cpp import Library, choose_device
 
@@ -122,4 +122,10 @@ def describe() -> dict:
         report["mlx"] = describe_mlx()
     except ImportError:
         report["mlx"] = {"installed": False}
+    try:
+        from .backend_max import describe as describe_max
+
+        report["max"] = describe_max()
+    except ImportError:
+        report["max"] = {"installed": False}
     return report
