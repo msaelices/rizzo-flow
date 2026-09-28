@@ -97,14 +97,18 @@ class SparkRunner:
         missing = set(graphs.weight_shapes()) - set(weights)
         if missing:
             raise ValueError(f"Checkpoint lacks {len(missing)} tensors, e.g. {min(missing)}")
+        # Uploaded once and passed to both graphs on every call.
+        self._weights = [self._buffer(weights[name]) for name in graphs.weight_shapes()]
         session = InferenceSession(devices=[device])
-        self._prefill = session.load(graphs.prefill(), weights_registry=weights)
-        self._score = session.load(graphs.score(), weights_registry=weights)
+        self._prefill = session.load(graphs.prefill())
+        self._score = session.load(graphs.score())
 
     def _buffer(self, array):
         from max.driver import Buffer
 
-        return Buffer.from_numpy(np.ascontiguousarray(array)).to(self.device)
+        if isinstance(array, np.ndarray):
+            return Buffer.from_numpy(np.ascontiguousarray(array)).to(self.device)
+        return Buffer.from_dlpack(array).to(self.device)  # safetensors WeightData (BF16)
 
     def empty_cache(self):
         from max.driver import Buffer
@@ -123,6 +127,7 @@ class SparkRunner:
                 self._buffer(np.arange(start, start + len(piece), dtype=np.int64)),
                 self._buffer(np.arange(start, dtype=np.int64)),
                 *cache,
+                *self._weights,
             )
         return cache
 
@@ -141,6 +146,7 @@ class SparkRunner:
             self._buffer(np.array(slots, dtype=np.int64)),
             self._buffer(np.arange(prefix_length, dtype=np.int64)),
             *cache,
+            *self._weights,
         )
         from max.driver import CPU
 

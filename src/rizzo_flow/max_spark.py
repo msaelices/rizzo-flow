@@ -1,6 +1,8 @@
 """Spark2.5 as MAX graphs: prefill a shared prefix, then read letter logits after short suffixes.
 
-Two compiled graphs with symbolic shapes, both reading the same weights:
+Two compiled graphs with symbolic shapes. The weights are trailing graph inputs, not constants,
+so both graphs read the same device buffers (as constants, each compiled model would hold its
+own copy on the device):
 
 - `prefill`: one sequence of new tokens after `P` cached ones; returns the K/V of all `P + S`
   positions for every layer. Called in chunks, so attention intermediates stay bounded.
@@ -63,8 +65,8 @@ class SparkConfig:
 
 
 class SparkGraphs:
-    """Builds the graphs. Weights are named as in the checkpoint, so the session binds them
-    straight from the safetensors files; each graph gets its own `Weight` objects."""
+    """Builds the graphs. Both take the weights as trailing inputs, in `weight_shapes()` order
+    (checkpoint names), after their own inputs and the per-layer K/V."""
 
     def __init__(self, config: SparkConfig, dtype, device):
         self.config = config
@@ -98,21 +100,24 @@ class SparkGraphs:
                 shapes[f"model.layers.{i}.{name}"] = shape
         return shapes
 
-    def _declare_weights(self):
-        from max.graph import Weight
+    def _weight_types(self):
+        from max.graph import TensorType
 
-        def weight(name, shape):
-            return Weight(name, self.dtype, shape, device=self.device)
+        return [
+            TensorType(self.dtype, shape, device=self.device)
+            for shape in self.weight_shapes().values()
+        ]
 
-        c = self.config
-        self.embedding = weight("model.embedding.weight", (c.vocab_size, c.hidden_size))
-        self.norm = weight("model.norm.weight", (c.hidden_size,))
+    def _bind_weights(self, values):
+        named = dict(zip(self.weight_shapes(), values, strict=True))
+        self.embedding = named["model.embedding.weight"]
+        self.norm = named["model.norm.weight"]
         self.layers = [
             {
-                role: weight(f"model.layers.{i}.{name}", shape)
-                for role, (name, shape) in self._block_weights().items()
+                role: named[f"model.layers.{i}.{name}"]
+                for role, (name, _) in self._block_weights().items()
             }
-            for i in range(c.num_layers)
+            for i in range(self.config.num_layers)
         ]
 
     # -- building blocks ---------------------------------------------------------------------
@@ -226,8 +231,8 @@ class SparkGraphs:
     # -- graphs ------------------------------------------------------------------------------
 
     def prefill(self):
-        """Inputs: tokens [S], positions [S] (P..P+S-1), past positions [P], then past K and V
-        per layer. Outputs: K and V per layer over all P + S positions."""
+        """Inputs: tokens [S], positions [S] (P..P+S-1), past positions [P], past K and V per
+        layer, weights. Outputs: K and V per layer over all P + S positions."""
         from max.dtype import DType
         from max.graph import Graph, TensorType, ops
 
@@ -236,10 +241,13 @@ class SparkGraphs:
             TensorType(DType.int64, ["S"], device=self.device),
             TensorType(DType.int64, ["P"], device=self.device),
             *self._cache_types(),
+            *self._weight_types(),
         ]
         with Graph("spark_prefill", input_types=inputs) as graph:
-            self._declare_weights()
-            tokens, positions, past_positions, *cache = (v.tensor for v in graph.inputs)
+            values = [v.tensor for v in graph.inputs]
+            tokens, positions, past_positions = values[:3]
+            cache = values[3 : 3 + 2 * self.config.num_layers]
+            self._bind_weights(values[3 + 2 * self.config.num_layers :])
             key_positions = ops.concat([past_positions, positions], axis=0)
             h = ops.unsqueeze(ops.gather(self.embedding, tokens, axis=0), 0)
             outputs = []
@@ -254,7 +262,7 @@ class SparkGraphs:
     def score(self):
         """Inputs: tokens [B, S] right-padded, positions [S], each row's last real token as a
         flat index `r * S + last` [B], candidate token ids [N], past positions [P], past K and
-        V per layer.
+        V per layer, weights.
         Output: fp32 logits [B, N] from the tied embedding rows of the candidates only."""
         from max.dtype import DType
         from max.graph import Graph, TensorType, ops
@@ -266,12 +274,13 @@ class SparkGraphs:
             TensorType(DType.int64, ["N"], device=self.device),
             TensorType(DType.int64, ["P"], device=self.device),
             *self._cache_types(),
+            *self._weight_types(),
         ]
         with Graph("spark_score", input_types=inputs) as graph:
-            self._declare_weights()
-            tokens, positions, last, slots, past_positions, *cache = (
-                v.tensor for v in graph.inputs
-            )
+            values = [v.tensor for v in graph.inputs]
+            tokens, positions, last, slots, past_positions = values[:5]
+            cache = values[5 : 5 + 2 * self.config.num_layers]
+            self._bind_weights(values[5 + 2 * self.config.num_layers :])
             key_positions = ops.concat([past_positions, positions], axis=0)
             h = ops.gather(self.embedding, tokens, axis=0)  # [B, S, hidden]
             for i in range(self.config.num_layers):
