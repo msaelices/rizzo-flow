@@ -322,3 +322,30 @@ Stesse risposte (0 argmax diversi su 146 decisioni appaiate, stessi `prompt_sha2
 lento: l'attenzione è scritta con op generiche del grafo (score fp32 materializzati), non con i
 kernel flash di MAX. La memoria non è confrontabile: MAX riserva tutta la memoria libera della
 scheda (picco = 3.50 GiB in ogni cella). Da rifare su una GPU che contenga il 4B e stati lunghi.
+
+### MAX ottimizzato (stesso giorno, `max-bf16-v5.json`)
+
+Profilato sulla stessa scheda: con dimensioni simboliche il matmul batched di MAX era ~17× più
+lento che con forme statiche e il suo kernel flash (teste da 256) ~11× più lento di matmul
+semplici, così il prefill cresceva di ~35 ms ogni 256 token in cache. Ora: attenzione come matmul
+2-D per testa KV (prefisso + token nuovi di tutte le righe, maschera a blocchi, score fp32),
+proiezioni fuse (QKV+gate, gate+up), embedding in memoria host, cache dei layer sliding tagliata
+alla finestra (ora entrano stati da 2048 token), una sola chiamata per domanda in `direct`.
+Report precedenti (`max-bf16.json`, `-flash`, `-v2`…`-v4`) restano come storico.
+
+| Stato · domande · modo | llama.cpp BF16 | llama.cpp Q8_0 | MAX BF16 | MAX/llama BF16 | argmax diversi vs BF16 | max Δp |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 512 · 1 · shared | 277 ms | 284 ms | 340 ms | 1.23 | 0/1 | 0.002 |
+| 512 · 8 · shared | 625 ms | 716 ms | 702 ms | 1.12 | 0/8 | 0.012 |
+| 512 · 64 · shared | 3.55 s | 4.71 s | 3.68 s | 1.04 | 0/64 | 0.019 |
+| 512 · 64 · direct | 18.9 s | 30.5 s | 33.5 s | 1.78 | 0/64 | 0.013 |
+| 2048 · 1 · shared | 877 ms | 1507 ms | 1633 ms | 1.86 | 0/1 | 0.000 |
+| 2048 · 8 · shared | 1.57 s | 2.22 s | 2.38 s | 1.52 | 3/8 | 0.027 |
+| 2048 · 64 · shared | 7.01 s | 6.69 s | 8.00 s | 1.14 | 15/64 | 0.028 |
+| 2048 · 64 · direct | 84.6 s | 106.9 s | 132.6 s | 1.57 | 0/64 | 0.012 |
+
+Gli argmax diversi a 2048 in shared sono pareggi (margine 0–0.006 in llama.cpp, che cambia
+gli stessi 15 fra il proprio shared e il proprio direct; MAX shared e direct concordano su tutti).
+Su richieste con molte domande MAX è alla pari con llama.cpp BF16 e più veloce di Q8_0 a 512
+token; resta più lento su una domanda sola e in `direct`, dove il prefill va a blocchi da 256
+token (512 non entra in 4 GiB con stati da 2048). Da rifare su una GPU più grande (e sul 4B).
