@@ -123,3 +123,25 @@ def test_loader_rejects_options_of_other_backends(tmp_path):
         loader.load_backend("max", model=tmp_path, weights="flow")
     with pytest.raises(ValueError, match="Model not found"):
         loader.load_backend("max", model=tmp_path / "missing")
+
+
+def test_runner_rejects_weights_that_do_not_match_the_config(reference):
+    import numpy as np
+    from max.driver import CPU
+    from max.dtype import DType
+    from mlx.utils import tree_flatten
+
+    from rizzo_flow.backend_max import SparkRunner
+    from rizzo_flow.max_spark import SparkConfig
+
+    config, model = reference
+    weights = {n: np.array(v, dtype=np.float32) for n, v in tree_flatten(model.parameters())}
+    spark = SparkConfig.from_hf(config)
+    with pytest.raises(ValueError, match="the graphs expect"):
+        SparkRunner(spark, weights, CPU(), DType.bfloat16)
+    weights["model.norm.weight"] = np.ones(3, dtype=np.float32)
+    with pytest.raises(ValueError, match="the config implies"):
+        SparkRunner(spark, weights, CPU(), DType.float32)
+    del weights["model.norm.weight"]
+    with pytest.raises(ValueError, match="lacks 1 tensors"):
+        SparkRunner(spark, weights, CPU(), DType.float32)

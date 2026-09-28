@@ -76,7 +76,11 @@ def describe() -> dict:
     return {
         "installed": importlib.metadata.version("max"),
         "devices": [
-            {"api": d.api, "architecture": d.architecture_name, "memory": d.stats["total_memory"]}
+            {
+                "api": d.api,
+                "architecture": d.architecture_name,
+                "memory": d.stats.get("total_memory"),
+            }
             for d in accelerators
         ],
         "auto_selects": "gpu" if accelerators else "cpu",
@@ -87,6 +91,7 @@ class SparkRunner:
     """The two compiled graphs and the device buffers they exchange."""
 
     def __init__(self, config: SparkConfig, weights, device, dtype):
+        from max.dtype import DType
         from max.engine import InferenceSession
         from max.graph import DeviceRef
 
@@ -97,6 +102,15 @@ class SparkRunner:
         missing = set(graphs.weight_shapes()) - set(weights)
         if missing:
             raise ValueError(f"Checkpoint lacks {len(missing)} tensors, e.g. {min(missing)}")
+        # The graphs type every weight input; a mismatch would only surface on the first call.
+        for name, shape in graphs.weight_shapes().items():
+            found = tuple(int(d) for d in weights[name].shape)
+            kind = weights[name].dtype  # max DType (safetensors) or numpy dtype (tests)
+            kind = kind if isinstance(kind, DType) else DType.from_numpy(kind)
+            if found != shape:
+                raise ValueError(f"{name} has shape {found}, the config implies {shape}")
+            if kind != dtype:
+                raise ValueError(f"{name} is {kind}, the graphs expect {dtype}")
         # Uploaded once and passed to both graphs on every call.
         self._weights = [self._buffer(weights[name]) for name in graphs.weight_shapes()]
         session = InferenceSession(devices=[device])
@@ -155,7 +169,7 @@ class SparkRunner:
     def free_bytes(self):
         if self.device.is_host:
             return None
-        return self.device.stats["free_memory"]
+        return self.device.stats.get("free_memory")
 
 
 class MaxBackend:
@@ -184,7 +198,7 @@ class MaxBackend:
             raise ValueError("ctx must be positive")
         started = time.perf_counter()
         target = pick_device(device)
-        idle_free = None if target.is_host else target.stats["free_memory"]
+        idle_free = None if target.is_host else target.stats.get("free_memory")
         hashes = checkpoint_hashes(path)
         config = json.loads((path / "config.json").read_text(encoding="utf-8"))
         spark = SparkConfig.from_hf(config)
@@ -252,6 +266,7 @@ class MaxBackend:
                 cache = runner.prefill(job.tokens[:-1], self.prefill_chunk)
                 logits = runner.score(cache, len(job.tokens) - 1, [job.tokens[-1:]], job.slots, pad)
                 result[job.id] = logits[0].tolist()
+                self._track_memory()  # while this job's K/V is still alive
                 evaluated_tokens += len(job.tokens)
                 batches += 1
                 del cache
@@ -266,12 +281,12 @@ class MaxBackend:
                 suffixes = [job.tokens[len(prefix) :] for job in group]
                 union = sorted({slot for job in group for slot in job.slots})
                 logits = runner.score(cache, len(prefix), suffixes, union, pad)
+                self._track_memory()  # prefix K/V plus this microbatch
                 for job, row in zip(group, logits, strict=True):
                     result[job.id] = [float(row[union.index(slot)]) for slot in job.slots]
                 evaluated_tokens += len(group) * max(map(len, suffixes))
                 batches += 1
             del cache
-        self._track_memory()
         timing = {
             "inference_seconds": time.perf_counter() - started,
             "prefill_seconds": prefix_seconds,
