@@ -91,11 +91,16 @@ def run(args):
         device=args.device,
         ctx=args.ctx,
         batch_size=args.batch_size,
+        prefill_chunk=args.prefill_chunk,
     )
     engine = Engine(backend, ctx=args.ctx)
     report = {
         "backend": args.backend,
-        "model": {**backend.metadata, "batch_size": args.batch_size},
+        "model": {
+            **backend.metadata,
+            "batch_size": args.batch_size,
+            "prefill_chunk": backend.prefill_chunk,
+        },
         "repeats": args.repeats,
         "cells": [],
     }
@@ -194,6 +199,7 @@ def main():
     bench.add_argument("--weights", choices=("flow", "base"))
     bench.add_argument("--device", default="auto")
     bench.add_argument("--batch-size", type=int, default=4)
+    bench.add_argument("--prefill-chunk", type=int, help="Tokens per prefill call (llama, max)")
     bench.add_argument("--ctx", type=int, default=12288, help="Above the longest state")
     bench.add_argument("--states", type=int, nargs="+", default=[512, 2048, 8192])
     bench.add_argument("--questions", type=int, nargs="+", default=[1, 8, 64])

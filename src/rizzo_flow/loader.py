@@ -25,6 +25,7 @@ def load_backend(
     batch_size=4,
     threads=None,
     kv_type=None,
+    prefill_chunk=None,
 ):
     if backend not in BACKENDS:
         raise ValueError(f"Backend must be one of: {', '.join(BACKENDS)}")
@@ -46,8 +47,11 @@ def load_backend(
             device=device,
             ctx=ctx,
             batch_size=batch_size,
+            **({"prefill_chunk": prefill_chunk} if prefill_chunk else {}),
         )
     if backend == "mlx":
+        if prefill_chunk:
+            raise ValueError("prefill_chunk is not configurable on the MLX backend")
         if quant:
             raise ValueError("--quant selects a GGUF file (llama backend); with MLX use --bits 4|8")
         if device not in MLX_DEVICES:
@@ -89,6 +93,7 @@ def load_backend(
         batch_size=batch_size,
         threads=threads,
         kv_type=kv_type,
+        **({"prefill_chunk": prefill_chunk} if prefill_chunk else {}),
     )
 
 
