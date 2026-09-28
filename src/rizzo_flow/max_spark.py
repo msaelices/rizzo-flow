@@ -106,7 +106,7 @@ class SparkGraphs:
 
     def input_shapes(self) -> dict[str, tuple[list[str], tuple[int, ...]]]:
         """The graphs' weight inputs, in order: key -> (checkpoint tensors to concatenate along
-        rows, resulting shape)."""
+        rows, then zero rows up to the resulting shape)."""
         c = self.config
         parts = self._block_weights()
         fused = {part for group in FUSED.values() for part in group}
@@ -122,7 +122,9 @@ class SparkGraphs:
             for role, group in FUSED.items():
                 rows = sum(parts[part][1][0] for part in group)
                 names = [prefix + parts[part][0] for part in group]
-                inputs[prefix + role] = (names, (rows, c.hidden_size))
+                # Zero rows up to a multiple of 128: MAX only picks its tensor-core matmul
+                # when N is one (qkvg: 3080 -> 3200 on the 1.7B), else cuBLAS with a memset.
+                inputs[prefix + role] = (names, (-(-rows // 128) * 128, c.hidden_size))
         return inputs
 
     def weight_device(self, key):
@@ -309,7 +311,8 @@ class SparkGraphs:
         q = self._rope(q, positions, kind)
         k = self._rope(k, positions, kind)
         attn = self._attention(q, k, v, past_k, past_v, masks[kind])
-        gate = ops.cast(ops.sigmoid(ops.cast(qkvg[..., end:], DType.float32)), h.dtype)
+        gate = qkvg[..., end : end + c.num_heads]  # then the zero padding rows
+        gate = ops.cast(ops.sigmoid(ops.cast(gate, DType.float32)), h.dtype)
         attn = attn * ops.unsqueeze(gate, -1)
         h = h + self._linear(ops.reshape(attn, [b, s, c.num_heads * c.head_dim]), w["out"])
         x = self._rms_norm(h, w["post_norm"])

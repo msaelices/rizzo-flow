@@ -91,7 +91,7 @@ class SparkRunner:
     """The two compiled graphs and the device buffers they exchange."""
 
     def __init__(self, config: SparkConfig, weights, device, dtype, batch_size=4):
-        from max.driver import CPU
+        from max.driver import CPU, Buffer
         from max.dtype import DType
         from max.engine import InferenceSession
         from max.graph import DeviceRef
@@ -119,11 +119,14 @@ class SparkRunner:
             self._concat_graph(DeviceRef.from_device(host))
         )
         self._weights = []
-        for key, (names, _) in graphs.input_shapes().items():
+        for key, (names, shape) in graphs.input_shapes().items():
             if len(names) == 1:
                 buffer = self._host_buffer(weights[names[0]])
             else:
-                buffer = concat.execute(*[self._host_buffer(weights[name]) for name in names])[0]
+                parts = [self._host_buffer(weights[name]) for name in names]
+                padding = shape[0] - sum(part.shape[0] for part in parts)
+                parts.append(Buffer.zeros([padding, shape[1]], dtype, device=host))
+                buffer = concat.execute(*parts)[0]
             if graphs.weight_device(key).is_gpu():
                 buffer = buffer.to(device)
             self._weights.append(buffer)
@@ -147,7 +150,7 @@ class SparkRunner:
         from max.graph import Graph, TensorType, ops
 
         hidden = self.config.hidden_size
-        types = [TensorType(self.dtype, [rows, hidden], device=device) for rows in ("A", "B")]
+        types = [TensorType(self.dtype, [rows, hidden], device=device) for rows in "ABC"]
         with Graph("spark_fuse", input_types=types) as graph:
             graph.output(ops.concat([v.tensor for v in graph.inputs], axis=0))
         return graph
