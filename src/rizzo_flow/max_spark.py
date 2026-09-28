@@ -141,6 +141,13 @@ class SparkGraphs:
             for key, (_, shape) in self.input_shapes().items()
         ]
 
+    def _head(self, final, slots):
+        """fp32 logits [rows, N]: the tied embedding's rows of the candidates only."""
+        from max.dtype import DType
+        from max.graph import ops
+
+        return ops.cast(ops.matmul(final, ops.transpose(self._embed(slots), 0, 1)), DType.float32)
+
     def _embed(self, ids):
         """Rows of the host-side embedding table for int64 ids (on the host), on the device."""
         from max.graph import ops
@@ -194,11 +201,12 @@ class SparkGraphs:
             parts.append(xf[..., dims:])
         return ops.cast(ops.concat(parts, axis=-1), x.dtype)
 
-    def _masks(self, rows, positions, past_positions):
-        """Additive fp32 masks [rows, 1, S, P + rows * S] per layer kind, built once per graph,
-        for `rows` sequences of S new tokens that all continue the same P cached ones. Keys are
-        the P prefix tokens, which precede every new one (only the sliding window masks them),
-        then all rows' new tokens, of which a query sees its own row's, causally."""
+    def _masks(self, rows, positions, past_positions, window_positions):
+        """Additive fp32 masks [rows, 1, S, cached + rows * S] per layer kind, built once per
+        graph, for `rows` sequences of S new tokens that all continue the same cached ones.
+        Keys are the cached tokens, which precede every new one (only the sliding window masks
+        them), then all rows' new tokens, of which a query sees its own row's, causally.
+        Full-attention layers cache all P prefix positions, sliding layers the last Q <= W."""
         from max.dtype import DType
         from max.graph import ops
 
@@ -207,7 +215,8 @@ class SparkGraphs:
         neg = ops.constant(-np.inf, DType.float32, device=self.device)
         s = positions.shape[0]
         qpos = ops.unsqueeze(positions, 1)  # [S, 1]
-        prefix = ops.where(ops.greater(ops.unsqueeze(past_positions, 0) + window, qpos), zero, neg)
+        in_reach = ops.greater(ops.unsqueeze(window_positions, 0) + window, qpos)  # [S, Q]
+        prefix = ops.where(in_reach, zero, neg)
         row_of = ops.constant(np.arange(rows).reshape(rows, 1), DType.int64, device=self.device)
         key_row = ops.reshape(ops.broadcast_to(row_of, [rows, s]), [rows * s])
         key_pos = ops.reshape(ops.broadcast_to(ops.unsqueeze(positions, 0), [rows, s]), [rows * s])
@@ -216,13 +225,20 @@ class SparkGraphs:
         in_window = ops.greater(key_pos + window, ops.unsqueeze(qpos, 0))
         full = ops.logical_and(same_row, ops.unsqueeze(causal, 1))  # [R, 1, S, RS]
         sliding = ops.logical_and(full, ops.unsqueeze(in_window, 1))
-        shape = [rows, 1, s, past_positions.shape[0]]
         return {
             SLIDING: ops.concat(
-                [ops.broadcast_to(prefix, shape), ops.where(sliding, zero, neg)], axis=-1
+                [
+                    ops.broadcast_to(prefix, [rows, 1, s, window_positions.shape[0]]),
+                    ops.where(sliding, zero, neg),
+                ],
+                axis=-1,
             ),
             "full_attention": ops.concat(
-                [ops.broadcast_to(zero, shape), ops.where(full, zero, neg)], axis=-1
+                [
+                    ops.broadcast_to(zero, [rows, 1, s, past_positions.shape[0]]),
+                    ops.where(full, zero, neg),
+                ],
+                axis=-1,
             ),
         }
 
@@ -302,17 +318,26 @@ class SparkGraphs:
         return h + self._linear(mlp, w["mlp_down"]), k, v
 
     def _cache_types(self):
+        """K and V per layer: [P, Hkv, D] on full-attention layers, [Q, Hkv, D] on sliding ones,
+        which only ever read the last `sliding_window` positions."""
         from max.graph import TensorType
 
         c = self.config
-        kv = TensorType(self.dtype, ["P", c.num_kv_heads, c.head_dim], device=self.device)
-        return [kv] * (2 * c.num_layers)
+        types = []
+        for kind in c.layer_types:
+            length = "Q" if kind == SLIDING else "P"
+            kv = TensorType(self.dtype, [length, c.num_kv_heads, c.head_dim], device=self.device)
+            types += [kv, kv]
+        return types
 
     # -- graphs ------------------------------------------------------------------------------
 
     def prefill(self):
-        """Inputs: tokens [S], positions [S] (P..P+S-1), past positions [P], past K and V per
-        layer, weights. Outputs: K and V per layer over all P + S positions."""
+        """Inputs: tokens [S], positions [S] (P..P+S-1), cached positions [P] and [Q] (the last
+        Q of them), candidate token ids [N], past K and V per layer, weights. Outputs: K and V
+        per layer over the cached and the new positions (the runner trims sliding layers back
+        to the window), then the fp32 logits [1, N] of the candidates after the last token, so
+        a single question needs no separate `score` call."""
         from max.dtype import DType
         from max.graph import DeviceRef, Graph, TensorType, ops
 
@@ -320,15 +345,17 @@ class SparkGraphs:
             TensorType(DType.int64, ["S"], device=DeviceRef.CPU()),
             TensorType(DType.int64, ["S"], device=self.device),
             TensorType(DType.int64, ["P"], device=self.device),
+            TensorType(DType.int64, ["Q"], device=self.device),
+            TensorType(DType.int64, ["N"], device=DeviceRef.CPU()),
             *self._cache_types(),
             *self._weight_types(),
         ]
         with Graph("spark_prefill", input_types=inputs) as graph:
             values = [v.tensor for v in graph.inputs]
-            tokens, positions, past_positions = values[:3]
-            cache = values[3 : 3 + 2 * self.config.num_layers]
-            self._bind_weights(values[3 + 2 * self.config.num_layers :])
-            masks = self._masks(1, positions, past_positions)
+            tokens, positions, past_positions, window_positions, slots = values[:5]
+            cache = values[5 : 5 + 2 * self.config.num_layers]
+            self._bind_weights(values[5 + 2 * self.config.num_layers :])
+            masks = self._masks(1, positions, past_positions, window_positions)
             h = ops.unsqueeze(self._embed(tokens), 0)
             outputs = []
             for i in range(self.config.num_layers):
@@ -338,13 +365,14 @@ class SparkGraphs:
                     ops.concat([past_k, ops.squeeze(k, 0)], axis=0),
                     ops.concat([past_v, ops.squeeze(v, 0)], axis=0),
                 ]
-            graph.output(*outputs)
+            final = self._rms_norm(h[:, -1, :], self.norm)  # [1, hidden]
+            graph.output(*outputs, self._head(final, slots))
         return graph
 
     def score(self, batch: int):
         """Inputs: tokens [batch, S] right-padded, positions [S], each row's last real token as a
-        flat index `r * S + last` [B], candidate token ids [N], past positions [P], past K and
-        V per layer, weights.
+        flat index `r * S + last` [B], candidate token ids [N], cached positions [P] and [Q],
+        past K and V per layer, weights.
         Output: fp32 logits [batch, N] from the tied embedding rows of the candidates only."""
         from max.dtype import DType
         from max.graph import DeviceRef, Graph, TensorType, ops
@@ -355,21 +383,20 @@ class SparkGraphs:
             TensorType(DType.int64, [batch], device=self.device),
             TensorType(DType.int64, ["N"], device=DeviceRef.CPU()),
             TensorType(DType.int64, ["P"], device=self.device),
+            TensorType(DType.int64, ["Q"], device=self.device),
             *self._cache_types(),
             *self._weight_types(),
         ]
         with Graph("spark_score", input_types=inputs) as graph:
             values = [v.tensor for v in graph.inputs]
-            tokens, positions, last, slots, past_positions = values[:5]
-            cache = values[5 : 5 + 2 * self.config.num_layers]
-            self._bind_weights(values[5 + 2 * self.config.num_layers :])
-            masks = self._masks(batch, positions, past_positions)
+            tokens, positions, last, slots, past_positions, window_positions = values[:6]
+            cache = values[6 : 6 + 2 * self.config.num_layers]
+            self._bind_weights(values[6 + 2 * self.config.num_layers :])
+            masks = self._masks(batch, positions, past_positions, window_positions)
             h = self._embed(tokens)  # [batch, S, hidden]
             for i in range(self.config.num_layers):
                 h, _, _ = self._layer(i, h, positions, cache[2 * i], cache[2 * i + 1], masks)
             flat = ops.reshape(h, [h.shape[0] * h.shape[1], self.config.hidden_size])
             final = self._rms_norm(ops.gather(flat, last, axis=0), self.norm)  # [B, hidden]
-            head = self._embed(slots)  # [N, hidden]
-            logits = ops.matmul(final, ops.transpose(head, 0, 1))
-            graph.output(ops.cast(logits, DType.float32))
+            graph.output(self._head(final, slots))
         return graph

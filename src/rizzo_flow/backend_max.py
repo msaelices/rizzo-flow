@@ -15,7 +15,7 @@ import numpy as np
 
 from .chat_template import compile_template
 from .config import FLOW_CHECKPOINTS, checkpoint_hashes, identify
-from .max_spark import SparkConfig, SparkGraphs
+from .max_spark import SLIDING, SparkConfig, SparkGraphs
 from .prompts import PROMPT_VERSION, Compiled, canonical
 
 
@@ -129,6 +129,13 @@ class SparkRunner:
             self._weights.append(buffer)
         session = InferenceSession(devices=[device])
         self._prefill = session.load(graphs.prefill())
+        # Cache entries (K and V) of the sliding-window layers.
+        self._sliding = [
+            2 * i + j
+            for i, kind in enumerate(config.layer_types)
+            if kind == SLIDING
+            for j in (0, 1)
+        ]
         # Score graphs have a static batch: one row for lone questions and `direct` mode, and
         # `batch_size` rows for microbatches, smaller groups padded with copies.
         self.batch_size = batch_size
@@ -163,19 +170,38 @@ class SparkRunner:
         empty = Buffer(self.dtype, [0, c.num_kv_heads, c.head_dim], device=self.device)
         return [empty] * (2 * c.num_layers)
 
-    def prefill(self, tokens, chunk):
-        """K/V for `tokens`, fed `chunk` at a time so attention scores stay bounded."""
-        cache = self.empty_cache()
+    def _positions(self, prefix_length):
+        """Cached positions of full-attention layers (all) and sliding ones (the window)."""
+        window = min(prefix_length, self.config.sliding_window)
+        return (
+            self._buffer(np.arange(prefix_length, dtype=np.int64)),
+            self._buffer(np.arange(prefix_length - window, prefix_length, dtype=np.int64)),
+        )
+
+    def prefill(self, tokens, chunk, slots=(0,)):
+        """(K/V for `tokens`, fp32 logits of `slots` after the last token). Fed `chunk` tokens
+        at a time so attention scores stay bounded. Sliding layers keep only the last
+        `sliding_window` positions (copied, so the rest is freed)."""
+        from max.driver import CPU
+
+        cache, logits = self.empty_cache(), None
+        window = self.config.sliding_window
+        candidates = self._host_buffer(np.array(slots, dtype=np.int64))
         for start in range(0, len(tokens), chunk):
             piece = tokens[start : start + chunk]
-            cache = self._prefill.execute(
+            *cache, logits = self._prefill.execute(
                 self._host_buffer(np.array(piece, dtype=np.int64)),
                 self._buffer(np.arange(start, start + len(piece), dtype=np.int64)),
-                self._buffer(np.arange(start, dtype=np.int64)),
+                *self._positions(start),
+                candidates,
                 *cache,
                 *self._weights,
             )
-        return cache
+            for index in self._sliding:
+                rows = cache[index].shape[0]
+                if rows > window:
+                    cache[index] = cache[index][rows - window :, :, :].copy()
+        return cache, None if logits is None else logits.to(CPU()).to_numpy()[0]
 
     def score(self, cache, prefix_length, suffixes, slots, pad):
         """fp32 logits [len(suffixes), len(slots)] after each suffix, all continuing `cache`."""
@@ -195,7 +221,7 @@ class SparkRunner:
             self._buffer(np.arange(prefix_length, prefix_length + width, dtype=np.int64)),
             self._buffer(last),
             self._host_buffer(np.array(slots, dtype=np.int64)),
-            self._buffer(np.arange(prefix_length, dtype=np.int64)),
+            *self._positions(prefix_length),
             *cache,
             *self._weights,
         )
@@ -300,16 +326,16 @@ class MaxBackend:
         reuse = mode == "shared" and bool(prefix) and len(jobs) > 1
         if not reuse:
             for job in jobs:
-                cache = runner.prefill(job.tokens[:-1], self.prefill_chunk)
-                logits = runner.score(cache, len(job.tokens) - 1, [job.tokens[-1:]], job.slots, pad)
-                result[job.id] = logits[0].tolist()
+                # The prefill's own last position gives the answer: one pass, no score call.
+                cache, logits = runner.prefill(job.tokens, self.prefill_chunk, job.slots)
+                result[job.id] = logits.tolist()
                 self._track_memory()  # while this job's K/V is still alive
                 evaluated_tokens += len(job.tokens)
                 batches += 1
                 del cache
         else:
             mark = time.perf_counter()
-            cache = runner.prefill(prefix, self.prefill_chunk)
+            cache, _ = runner.prefill(prefix, self.prefill_chunk)
             prefix_seconds = time.perf_counter() - mark
             evaluated_tokens += len(prefix)
             ordered = sorted(jobs, key=lambda j: len(j.tokens))
