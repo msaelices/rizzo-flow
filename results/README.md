@@ -301,3 +301,24 @@ Come leggerli:
 - Non eseguiti: WANLI ed Every (richiedono il download delle sorgenti), sottoinsieme TypeSafe (non
   ridistribuibile), confronto con generazione JSON e riuso seriale del prefisso (Rizzo non ha
   quei percorsi), SemIf sulla stessa GPU.
+
+## Runtime MAX (28 settembre 2026, Linux, RTX 3050 Ti Laptop 4 GiB, prompt v3)
+
+`--backend max` (MAX 26.6.0, grafi propri, BF16), 1.7B fine-tuned, stessa GPU di llama.cpp
+b11081 CUDA; report in `backend-bench/1.7b-rtx3050ti-laptop/` (`scripts/backend_bench.py`,
+3 ripetizioni a caldo, driver 580.173.02). Stato sintetico di 512 token (~728 token per domanda):
+con i pesi BF16 (3.4 GB) la scheda non regge stati da 2048 token con MAX; MAX con
+`--prefill-chunk 256` (a 512 va in OOM), llama.cpp con i suoi 512.
+
+| Domande · modo | llama.cpp BF16 p50 | llama.cpp Q8_0 p50 | MAX BF16 p50 | MAX/llama BF16 | argmax diversi | max Δp vs BF16 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 · shared | 277 ms | 284 ms | 469 ms | 1.70 | 0/1 | 0.002 |
+| 8 · shared | 625 ms | 716 ms | 1084 ms | 1.73 | 0/8 | 0.013 |
+| 64 · shared | 3551 ms | 4712 ms | 9330 ms | 2.63 | 0/64 | 0.015 |
+| 8 · direct | 2241 ms | 4084 ms | 5004 ms | 2.23 | 0/8 | 0.007 |
+| 64 · direct | 18856 ms | 30523 ms | 61539 ms | 3.26 | 0/64 | 0.007 |
+
+Stesse risposte (0 argmax diversi su 146 decisioni appaiate, stessi `prompt_sha256`), MAX più
+lento: l'attenzione è scritta con op generiche del grafo (score fp32 materializzati), non con i
+kernel flash di MAX. La memoria non è confrontabile: MAX riserva tutta la memoria libera della
+scheda (picco = 3.50 GiB in ogni cella). Da rifare su una GPU che contenga il 4B e stati lunghi.
