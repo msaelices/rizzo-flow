@@ -125,7 +125,8 @@ class SparkGraphs:
     def _rms_norm(self, x, w):
         from max.graph import ops
 
-        return ops.rms_norm(x, w, self.config.rms_norm_eps)
+        # Scale by the weight in fp32 before rounding to BF16, as MLX's fused kernel does.
+        return ops.rms_norm(x, w, self.config.rms_norm_eps, multiply_before_cast=True)
 
     def _rope(self, x, positions, kind):
         """Rotate the first `dims` channels of `x` [..., S, heads, head_dim] (half-split pairs),
