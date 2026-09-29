@@ -64,6 +64,19 @@ def test_shared_prefix_and_state_mutation(payload):
     assert other != prefix
 
 
+def test_single_option_is_still_a_decision_with_abstention(payload):
+    # One option plus the built-in __insufficient__: two slots, a real decision (the fake backend
+    # favours the second, so abstention wins); without abstention it is certain.
+    payload["questions"] = {"route": payload["questions"]["route"]}
+    payload["questions"]["route"]["options"] = [{"id": "access", "description": "Login problem"}]
+    answer = Engine(FakeBackend()).decide(payload)["answers"]["route"]
+    assert answer["status"] == "insufficient_evidence" and answer["choice"] is None
+    payload["questions"]["route"]["policy"] = {"allow_abstain": False}
+    answer = Engine(FakeBackend()).decide(payload)["answers"]["route"]
+    assert answer["choice"] == "access" and answer["probabilities"]["access"] == pytest.approx(1)
+    assert answer["uncertainty"]["concentration"] == 1
+
+
 def test_limits_reject_without_truncation(payload):
     with pytest.raises(ValueError, match="no truncation"):
         Engine(FakeBackend(), ctx=10).decide(payload)
