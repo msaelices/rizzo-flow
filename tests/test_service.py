@@ -32,7 +32,7 @@ class FakeBackend:
         self.metadata = {"fingerprint": "test-only"}
 
     def score(self, prefix, jobs, mode):
-        return {j.id: [0, 10] + [0] * (len(j.slots) - 2) for j in jobs}, {"generated_tokens": 0}
+        return {j.id: ([0, 10] + [0] * (len(j.slots) - 2))[: len(j.slots)] for j in jobs}, {"generated_tokens": 0}
 
 
 @pytest.fixture
