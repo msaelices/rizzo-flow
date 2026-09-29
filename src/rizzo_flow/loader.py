@@ -26,6 +26,7 @@ def load_backend(
     threads=None,
     kv_type=None,
     prefill_chunk=None,
+    max_resident=None,
 ):
     if backend not in BACKENDS:
         raise ValueError(f"Backend must be one of: {', '.join(BACKENDS)}")
@@ -48,7 +49,10 @@ def load_backend(
             ctx=ctx,
             batch_size=batch_size,
             **({"prefill_chunk": prefill_chunk} if prefill_chunk else {}),
+            **({"max_resident": max_resident} if max_resident else {}),
         )
+    if max_resident:
+        raise ValueError("--max-resident exists only in the MAX backend")
     if backend == "mlx":
         if prefill_chunk:
             raise ValueError("prefill_chunk is not configurable on the MLX backend")

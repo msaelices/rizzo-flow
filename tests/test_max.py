@@ -129,6 +129,8 @@ def test_loader_rejects_options_of_other_backends(tmp_path):
         loader.load_backend("max", device="vulkan")
     with pytest.raises(ValueError, match="--kv-type"):
         loader.load_backend("max", kv_type="q8_0")
+    with pytest.raises(ValueError, match="--max-resident"):
+        loader.load_backend("llama", max_resident=4)
     with pytest.raises(ValueError, match="--weights"):
         loader.load_backend("max", model=tmp_path, weights="flow")
     with pytest.raises(ValueError, match="Model not found"):
