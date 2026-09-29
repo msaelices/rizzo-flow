@@ -1,17 +1,16 @@
 """Spark2.5 as MAX graphs: prefill a shared prefix, then read letter logits after short suffixes.
 
-Two compiled graphs with symbolic shapes. The weights are trailing graph inputs, not constants,
-so both graphs read the same device buffers (as constants, each compiled model would hold its
-own copy on the device):
+Two kinds of compiled graph. The weights are trailing graph inputs, not constants, so every
+graph reads the same device buffers (as constants, each compiled model would hold its own copy):
 
-- `prefill`: one sequence of new tokens after `P` cached ones; returns the K/V of all `P + S`
-  positions for every layer. Called in chunks, so attention intermediates stay bounded.
-- `score`: `B` right-padded suffixes that all continue the same cached prefix; returns the
-  logits of the requested token ids at each suffix's last real position. The prefix K/V is
-  broadcast to the batch, never copied per branch, and nothing is written back.
+- `prefill`: one chunk of new tokens after the cached ones; returns the chunk's K/V, which the
+  runner writes into the cache, and the candidate logits after its last real token.
+- `score`: right-padded suffixes that all continue the same cache; returns the logits of the
+  requested token ids at each suffix's last real position. Nothing is written back.
 
-Attention is written with 2-D matmuls and an fp32 mask and softmax (like MLX's fused kernel),
-split between the shared prefix and each row's own new tokens. RoPE angles are computed in fp32 from the
+All shapes are static, so graphs are built per size bucket (cache capacity, suffix width): MAX
+only runs its tensor-core kernels on static sizes. Attention is written with 2-D matmuls and an
+fp32 mask and softmax (like MLX's fused kernel). RoPE angles are computed in fp32 from the
 positions, as MLX does, rather than read from a BF16 table.
 """
 
@@ -206,93 +205,83 @@ class SparkGraphs:
     def _masks(self, rows, positions, past_positions, window_positions):
         """Additive fp32 masks [rows, 1, S, cached + rows * S] per layer kind, built once per
         graph, for `rows` sequences of S new tokens that all continue the same cached ones.
-        Keys are the cached tokens, which precede every new one (only the sliding window masks
-        them), then all rows' new tokens, of which a query sees its own row's, causally.
-        Full-attention layers cache all P prefix positions, sliding layers the last Q <= W."""
+
+        Keys are the cache (C rows on full-attention layers, a ring of Wc rows on sliding ones),
+        then all rows' new tokens, of which a query sees its own row's. Everything is causal on
+        absolute positions, so unused cache rows, which hold a far-future position, and padding
+        tokens, which come after the real ones, are never seen by a real query."""
         from max.dtype import DType
         from max.graph import ops
 
         window = ops.constant(self.config.sliding_window, DType.int64, device=self.device)
         zero = ops.constant(0.0, DType.float32, device=self.device)
         neg = ops.constant(-np.inf, DType.float32, device=self.device)
-        s = positions.shape[0]
+        s = int(positions.shape[0])
         qpos = ops.unsqueeze(positions, 1)  # [S, 1]
-        in_reach = ops.greater(ops.unsqueeze(window_positions, 0) + window, qpos)  # [S, Q]
-        prefix = ops.where(in_reach, zero, neg)
+
+        def visible(keys, sliding):  # keys [..., K] against qpos [S, 1] -> bool [S, K]
+            allowed = ops.greater_equal(qpos, keys)
+            if sliding:
+                allowed = ops.logical_and(allowed, ops.greater(keys + window, qpos))
+            return allowed
+
         row_of = ops.constant(np.arange(rows).reshape(rows, 1), DType.int64, device=self.device)
         key_row = ops.reshape(ops.broadcast_to(row_of, [rows, s]), [rows * s])
         key_pos = ops.reshape(ops.broadcast_to(ops.unsqueeze(positions, 0), [rows, s]), [rows * s])
         same_row = ops.equal(ops.unsqueeze(ops.unsqueeze(row_of, 2), 3), key_row)  # [R,1,1,RS]
-        causal = ops.greater_equal(ops.unsqueeze(qpos, 0), key_pos)  # [1, S, RS]
-        in_window = ops.greater(key_pos + window, ops.unsqueeze(qpos, 0))
-        full = ops.logical_and(same_row, ops.unsqueeze(causal, 1))  # [R, 1, S, RS]
-        sliding = ops.logical_and(full, ops.unsqueeze(in_window, 1))
-        return {
-            SLIDING: ops.concat(
-                [
-                    ops.broadcast_to(prefix, [rows, 1, s, window_positions.shape[0]]),
-                    ops.where(sliding, zero, neg),
-                ],
-                axis=-1,
-            ),
-            "full_attention": ops.concat(
-                [
-                    ops.broadcast_to(zero, [rows, 1, s, past_positions.shape[0]]),
-                    ops.where(full, zero, neg),
-                ],
-                axis=-1,
-            ),
-        }
+        masks = {}
+        for kind, cached in ((SLIDING, window_positions), ("full_attention", past_positions)):
+            sliding = kind == SLIDING
+            on_cache = ops.where(visible(ops.unsqueeze(cached, 0), sliding), zero, neg)
+            on_new = visible(ops.unsqueeze(key_pos, 0), sliding)  # [S, RS]
+            on_new = ops.where(ops.logical_and(same_row, on_new), zero, neg)  # [R, 1, S, RS]
+            shape = [rows, 1, s, int(cached.shape[0])]
+            masks[kind] = ops.concat([ops.broadcast_to(on_cache, shape), on_new], axis=-1)
+        return masks
 
     def _attention(self, q, k, v, past_k, past_v, mask):
-        """Grouped-query attention of q [R, S, H, D] over the shared prefix (past K/V
-        [P, Hkv, D]) and the rows' own new keys k, v [R, S, Hkv, D], with an additive `mask`
-        [R, 1, S, P + R*S] from `_masks`. Returns [R, S, H, D].
+        """Grouped-query attention of q [R, S, H, D] over the shared cache (past K and V, one
+        [C, D] tensor per KV head) and the rows' own new keys k, v [R, S, Hkv, D], with an
+        additive `mask` [R, 1, S, C + R*S] from `_masks`. Returns [R, S, H, D].
 
-        Per KV head, one matmul pair for all rows' queries at once, against the prefix keys
+        Per KV head, one matmul pair for all rows' queries at once, against the cached keys
         followed by every row's new keys, block-masked to each row: the kernel count does not
-        grow with the batch and the prefix is never copied per row. 2-D matmuls in the model dtype
-        (tensor cores on GPUs; fp32 on the CPU, where MAX's BF16 matmul is slow), fp32 mask
-        and softmax. With symbolic lengths MAX's batched matmul, and its flash kernel with
-        256-wide heads, were 5-11x slower on an RTX 3050 Ti."""
+        grow with the batch and the cache is never copied per row. Every size is static and a
+        multiple of 128, so MAX picks its tensor-core matmul: with symbolic lengths it fell back
+        to cuBLAS (plus a 32 MiB memset per call) or to a naive batched kernel, and its flash
+        kernel has no fast path for 256-wide heads before Hopper. Scores and softmax are fp32,
+        as in MLX (BF16 scores moved probabilities by up to 0.03); the CPU uses fp32 throughout,
+        MAX's BF16 matmul being slow there."""
         from max.dtype import DType
         from max.graph import ops
 
         c = self.config
         group = c.num_heads // c.num_kv_heads
-        rows, s = int(q.shape[0]), q.shape[1]
-        p = past_k.shape[0]
+        rows, s = int(q.shape[0]), int(q.shape[1])
+        keys = int(past_k[0].shape[0]) + rows * s
         compute = q.dtype if self.device.is_gpu() else DType.float32
         scale = c.head_dim**-0.5
         heads = []
         for j in range(c.num_kv_heads):
             # Query heads j*G .. j*G+G-1 read KV head j, as in MLX and transformers.
             qj = ops.permute(q[:, :, j * group : (j + 1) * group, :], [0, 2, 1, 3])  # [R,G,S,D]
-            qj = ops.cast(ops.reshape(qj, [rows * group * s, c.head_dim]), compute)
-            # Keys and values [P + R*S, D]: the prefix, then every row's new tokens.
+            qj = ops.reshape(qj, [rows * group * s, c.head_dim])
             kj, vj = (
-                ops.cast(
-                    ops.concat(
-                        [past[:, j, :], ops.reshape(x[:, :, j, :], [rows * s, c.head_dim])], axis=0
-                    ),
-                    compute,
-                )
+                ops.concat([past[j], ops.reshape(x[:, :, j, :], [rows * s, c.head_dim])], axis=0)
                 for past, x in ((past_k, k), (past_v, v))
-            )
-            # Scores in fp32, as in MLX: BF16 scores moved probabilities by up to 0.03.
+            )  # [C + R*S, D]
             qf, kf = ops.cast(qj, DType.float32), ops.cast(kj, DType.float32)
             scores = ops.matmul(qf, ops.transpose(kf, 0, 1)) * scale
-            scores = ops.reshape(scores, [rows, group, s, p + rows * s])
-            probs = ops.softmax(scores + mask)
-            probs = ops.cast(ops.reshape(probs, [rows * group * s, p + rows * s]), compute)
-            out = ops.matmul(probs, vj)  # [R*G*S, D]
+            probs = ops.softmax(ops.reshape(scores, [rows, group, s, keys]) + mask)
+            probs = ops.cast(ops.reshape(probs, [rows * group * s, keys]), compute)
+            out = ops.matmul(probs, ops.cast(vj, compute))  # [R*G*S, D]
             out = ops.permute(ops.reshape(out, [rows, group, s, c.head_dim]), [0, 2, 1, 3])
             heads.append(out)  # [R, S, G, D]
         return ops.cast(ops.concat(heads, axis=2), q.dtype)
 
     def _layer(self, i, h, positions, past_k, past_v, masks):
-        """One block on h [R, S, hidden]; past K/V [P, Hkv, D] shared by the rows.
-        Returns (h, k, v) with k, v the rows' new keys and values [R, S, Hkv, D]."""
+        """One block on h [R, S, hidden]; past K and V (one [C, D] tensor per KV head) shared by
+        the rows. Returns (h, k, v) with k, v the rows' new keys and values [R, S, Hkv, D]."""
         from max.dtype import DType
         from max.graph import ops
 
@@ -320,86 +309,106 @@ class SparkGraphs:
         mlp = ops.gelu(gate_up[..., : c.intermediate_size]) * gate_up[..., c.intermediate_size :]
         return h + self._linear(mlp, w["mlp_down"]), k, v
 
-    def _cache_types(self):
-        """K and V per layer: [P, Hkv, D] on full-attention layers, [Q, Hkv, D] on sliding ones,
-        which only ever read the last `sliding_window` positions."""
+    def ring_size(self, block):
+        """Rows of a sliding layer's ring cache: the window, rounded up to whole blocks."""
+        return -(-self.config.sliding_window // block) * block
+
+    def _cache_types(self, capacity, ring):
+        """Per layer, K then V, one [rows, D] tensor per KV head: `capacity` rows on
+        full-attention layers, `ring` rows on sliding ones (they only read the window)."""
         from max.graph import TensorType
 
         c = self.config
         types = []
         for kind in c.layer_types:
-            length = "Q" if kind == SLIDING else "P"
-            kv = TensorType(self.dtype, [length, c.num_kv_heads, c.head_dim], device=self.device)
-            types += [kv, kv]
+            rows = ring if kind == SLIDING else capacity
+            head = TensorType(self.dtype, [rows, c.head_dim], device=self.device)
+            types += [head] * (2 * c.num_kv_heads)
         return types
 
-    # -- graphs ------------------------------------------------------------------------------
+    def _split_cache(self, values):
+        """Graph cache inputs -> per layer (K heads, V heads)."""
+        per_layer = 2 * self.config.num_kv_heads
+        heads = self.config.num_kv_heads
+        return [
+            (
+                values[i * per_layer : i * per_layer + heads],
+                values[i * per_layer + heads : (i + 1) * per_layer],
+            )
+            for i in range(self.config.num_layers)
+        ]
 
-    def prefill(self):
-        """Inputs: tokens [S], positions [S] (P..P+S-1), cached positions [P] and [Q] (the last
-        Q of them), candidate token ids [N], past K and V per layer, weights. Outputs: K and V
-        per layer over the cached and the new positions (the runner trims sliding layers back
-        to the window), then the fp32 logits [1, N] of the candidates after the last token, so
-        a single question needs no separate `score` call."""
+    # -- graphs ------------------------------------------------------------------------------
+    # Every shape is static (MAX's fast kernels need it): graphs are built per size bucket.
+
+    def prefill(self, capacity: int, ring: int, chunk: int):
+        """Inputs: tokens [chunk] (right-padded), positions [chunk], index of the last real
+        token [1], candidate token ids [N], cache positions [capacity] and [ring], the cache,
+        weights. Outputs: the new K and V per layer and KV head [chunk, D] (the runner writes
+        the real rows into the cache), then the fp32 logits [1, N] of the candidates after the
+        last real token, so a single question needs no separate `score` call."""
         from max.dtype import DType
         from max.graph import DeviceRef, Graph, TensorType, ops
 
+        c = self.config
         inputs = [
-            TensorType(DType.int64, ["S"], device=DeviceRef.CPU()),
-            TensorType(DType.int64, ["S"], device=self.device),
-            TensorType(DType.int64, ["P"], device=self.device),
-            TensorType(DType.int64, ["Q"], device=self.device),
+            TensorType(DType.int64, [chunk], device=DeviceRef.CPU()),
+            TensorType(DType.int64, [chunk], device=self.device),
+            TensorType(DType.int64, [1], device=self.device),
             TensorType(DType.int64, ["N"], device=DeviceRef.CPU()),
-            *self._cache_types(),
+            TensorType(DType.int64, [capacity], device=self.device),
+            TensorType(DType.int64, [ring], device=self.device),
+            *self._cache_types(capacity, ring),
             *self._weight_types(),
         ]
-        with Graph("spark_prefill", input_types=inputs) as graph:
+        cached = 2 * c.num_layers * c.num_kv_heads
+        with Graph(f"spark_prefill_{capacity}_{ring}_{chunk}", input_types=inputs) as graph:
             values = [v.tensor for v in graph.inputs]
-            tokens, positions, past_positions, window_positions, slots = values[:5]
-            cache = values[5 : 5 + 2 * self.config.num_layers]
-            self._bind_weights(values[5 + 2 * self.config.num_layers :])
+            tokens, positions, last, slots, past_positions, window_positions = values[:6]
+            cache = self._split_cache(values[6 : 6 + cached])
+            self._bind_weights(values[6 + cached :])
             masks = self._masks(1, positions, past_positions, window_positions)
             h = ops.unsqueeze(self._embed(tokens), 0)
             outputs = []
-            for i in range(self.config.num_layers):
-                past_k, past_v = cache[2 * i], cache[2 * i + 1]
-                h, k, v = self._layer(i, h, positions, past_k, past_v, masks)
-                outputs += [
-                    ops.concat([past_k, ops.squeeze(k, 0)], axis=0),
-                    ops.concat([past_v, ops.squeeze(v, 0)], axis=0),
-                ]
-            final = self._rms_norm(h[:, -1, :], self.norm)  # [1, hidden]
+            for i in range(c.num_layers):
+                h, k, v = self._layer(i, h, positions, *cache[i], masks)
+                outputs += [k[0, :, j, :] for j in range(c.num_kv_heads)]
+                outputs += [v[0, :, j, :] for j in range(c.num_kv_heads)]
+            final = self._rms_norm(ops.gather(h[0], last, axis=0), self.norm)  # [1, hidden]
             graph.output(*outputs, self._head(final, slots))
         return graph
 
-    def score(self, batch: int):
-        """Inputs: tokens [batch, S] right-padded, positions [S], each row's last real token as a
-        flat index `r * S + last` [B], candidate token ids [N], cached positions [P] and [Q],
-        past K and V per layer, weights.
+    def score(self, capacity: int, ring: int, batch: int, width: int):
+        """Inputs: tokens [batch, width] right-padded, positions [width], each row's last real
+        token as a flat index `r * width + last` [batch], candidate token ids [N], cache
+        positions [capacity] and [ring], the cache, weights.
         Output: fp32 logits [batch, N] from the tied embedding rows of the candidates only."""
         from max.dtype import DType
         from max.graph import DeviceRef, Graph, TensorType, ops
 
+        c = self.config
         inputs = [
-            TensorType(DType.int64, [batch, "S"], device=DeviceRef.CPU()),
-            TensorType(DType.int64, ["S"], device=self.device),
+            TensorType(DType.int64, [batch, width], device=DeviceRef.CPU()),
+            TensorType(DType.int64, [width], device=self.device),
             TensorType(DType.int64, [batch], device=self.device),
             TensorType(DType.int64, ["N"], device=DeviceRef.CPU()),
-            TensorType(DType.int64, ["P"], device=self.device),
-            TensorType(DType.int64, ["Q"], device=self.device),
-            *self._cache_types(),
+            TensorType(DType.int64, [capacity], device=self.device),
+            TensorType(DType.int64, [ring], device=self.device),
+            *self._cache_types(capacity, ring),
             *self._weight_types(),
         ]
-        with Graph("spark_score", input_types=inputs) as graph:
+        cached = 2 * c.num_layers * c.num_kv_heads
+        name = f"spark_score_{capacity}_{ring}_{batch}_{width}"
+        with Graph(name, input_types=inputs) as graph:
             values = [v.tensor for v in graph.inputs]
             tokens, positions, last, slots, past_positions, window_positions = values[:6]
-            cache = values[6 : 6 + 2 * self.config.num_layers]
-            self._bind_weights(values[6 + 2 * self.config.num_layers :])
+            cache = self._split_cache(values[6 : 6 + cached])
+            self._bind_weights(values[6 + cached :])
             masks = self._masks(batch, positions, past_positions, window_positions)
-            h = self._embed(tokens)  # [batch, S, hidden]
-            for i in range(self.config.num_layers):
-                h, _, _ = self._layer(i, h, positions, cache[2 * i], cache[2 * i + 1], masks)
-            flat = ops.reshape(h, [h.shape[0] * h.shape[1], self.config.hidden_size])
+            h = self._embed(tokens)  # [batch, width, hidden]
+            for i in range(c.num_layers):
+                h, _, _ = self._layer(i, h, positions, *cache[i], masks)
+            flat = ops.reshape(h, [batch * width, c.hidden_size])
             final = self._rms_norm(ops.gather(flat, last, axis=0), self.norm)  # [B, hidden]
             graph.output(self._head(final, slots))
         return graph

@@ -69,8 +69,18 @@ def backend(reference):
     class Tokenizer:
         pad_token_id = 0
 
-    runner = SparkRunner(SparkConfig.from_hf(config), weights, CPU(), DType.float32, batch_size=3)
-    return MaxBackend(runner, Tokenizer(), {}, batch_size=3, prefill_chunk=7)
+    # Blocks of 8 so that the small model still crosses chunk and bucket boundaries.
+    runner = SparkRunner(
+        SparkConfig.from_hf(config),
+        weights,
+        CPU(),
+        DType.float32,
+        batch_size=3,
+        chunk=8,
+        block=8,
+        min_view=8,
+    )
+    return MaxBackend(runner, Tokenizer(), {}, batch_size=3, prefill_chunk=8)
 
 
 def mlx_logits(model, tokens):

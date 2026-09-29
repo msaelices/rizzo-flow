@@ -8,7 +8,9 @@ files. The prefix K/V stays on the device between calls; branches read it, never
 import hashlib
 import importlib.metadata
 import json
+import math
 import time
+from collections import OrderedDict
 from pathlib import Path
 
 import numpy as np
@@ -87,10 +89,38 @@ def describe() -> dict:
     }
 
 
-class SparkRunner:
-    """The two compiled graphs and the device buffers they exchange."""
+FAR = 1 << 40  # position of unused cache rows: after every query, so never visible
 
-    def __init__(self, config: SparkConfig, weights, device, dtype, batch_size=4):
+
+class KVCache:
+    """The K/V of a prefix: per layer, K then V, one [rows, D] device buffer per KV head.
+    Full-attention layers hold `capacity` rows (a size bucket), sliding layers a ring of the
+    last `ring` positions; `positions` give each row's absolute position (FAR when unused)."""
+
+    def __init__(self, buffers, capacity, ring):
+        self.buffers = buffers
+        self.capacity = capacity
+        self.length = 0
+        self.positions = np.full(capacity, FAR, dtype=np.int64)
+        self.ring_positions = np.full(ring, FAR, dtype=np.int64)
+
+
+class SparkRunner:
+    """Compiled graphs, one per size bucket and built on first use, and the device buffers
+    they exchange."""
+
+    def __init__(
+        self,
+        config: SparkConfig,
+        weights,
+        device,
+        dtype,
+        batch_size=4,
+        chunk=512,
+        block=128,
+        max_resident=4,
+        min_view=1024,
+    ):
         from max.driver import CPU, Buffer
         from max.dtype import DType
         from max.engine import InferenceSession
@@ -130,21 +160,26 @@ class SparkRunner:
             if graphs.weight_device(key).is_gpu():
                 buffer = buffer.to(device)
             self._weights.append(buffer)
-        session = InferenceSession(devices=[device])
-        self._prefill = session.load(graphs.prefill())
-        # Cache entries (K and V) of the sliding-window layers.
-        self._sliding = [
-            2 * i + j
-            for i, kind in enumerate(config.layer_types)
-            if kind == SLIDING
-            for j in (0, 1)
-        ]
-        # Score graphs have a static batch: one row for lone questions and `direct` mode, and
-        # `batch_size` rows for microbatches, smaller groups padded with copies.
+        # Sizes are multiples of `block` (128: what MAX's tensor-core matmul needs). A prefill
+        # chunk must also divide the sliding ring, so its writes never wrap.
+        self.block = block
+        self.ring = graphs.ring_size(block)
+        if chunk % block or self.ring % chunk:
+            raise ValueError(
+                f"prefill_chunk must be a multiple of {block} dividing {self.ring}, not {chunk}"
+            )
+        self.chunk = chunk
+        self.min_view = min_view
+        # Score graphs have a static batch: one row for a lone suffix, `batch_size` rows for
+        # microbatches, smaller groups padded with copies.
         self.batch_size = batch_size
-        self._score = {1: session.load(graphs.score(1))}
-        if batch_size > 1:
-            self._score[batch_size] = session.load(graphs.score(batch_size))
+        self._graphs = graphs
+        self._session = InferenceSession(devices=[device])
+        # Each compiled graph holds its own activation memory on the device: keep only the
+        # most recently used ones (the others reload from MAX's disk cache in seconds).
+        self._compiled = OrderedDict()
+        self.max_resident = max_resident
+        self._sliding = [kind == SLIDING for kind in config.layer_types]
 
     def _concat_graph(self, device):
         from max.graph import Graph, TensorType, ops
@@ -166,70 +201,115 @@ class SparkRunner:
     def _buffer(self, array):
         return self._host_buffer(array).to(self.device)
 
-    def empty_cache(self):
+    def _model(self, kind, *sizes):
+        """The compiled graph for a size bucket, built (and cached by MAX on disk) on first use."""
+        key = (kind, *sizes)
+        if key in self._compiled:
+            self._compiled.move_to_end(key)
+        else:
+            while len(self._compiled) >= self.max_resident:
+                self._compiled.popitem(last=False)
+            self._compiled[key] = self._session.load(getattr(self._graphs, kind)(*sizes))
+        return self._compiled[key]
+
+    def _bucket(self, rows, unit):
+        """The smallest `unit * 2**k` holding `rows`."""
+        size = unit
+        while size < rows:
+            size *= 2
+        return size
+
+    def _layer_buffers(self, rows_full):
         from max.driver import Buffer
 
         c = self.config
-        empty = Buffer(self.dtype, [0, c.num_kv_heads, c.head_dim], device=self.device)
-        return [empty] * (2 * c.num_layers)
+        buffers = []
+        for sliding in self._sliding:
+            rows = self.ring if sliding else rows_full
+            for _ in range(2 * c.num_kv_heads):
+                buffers.append(Buffer.zeros([rows, c.head_dim], self.dtype, device=self.device))
+        return buffers
 
-    def _positions(self, prefix_length):
-        """Cached positions of full-attention layers (all) and sliding ones (the window)."""
-        window = min(prefix_length, self.config.sliding_window)
-        return (
-            self._buffer(np.arange(prefix_length, dtype=np.int64)),
-            self._buffer(np.arange(prefix_length - window, prefix_length, dtype=np.int64)),
-        )
+    def _views(self, cache, rows):
+        """The cache buffers, full-attention layers cut to their first `rows` rows."""
+        per_layer = 2 * self.config.num_kv_heads
+        return [
+            buffer if self._sliding[index // per_layer] else buffer[:rows, :]
+            for index, buffer in enumerate(cache.buffers)
+        ]
 
-    def prefill(self, tokens, chunk, slots=(0,)):
-        """(K/V for `tokens`, fp32 logits of `slots` after the last token). Fed `chunk` tokens
-        at a time so attention scores stay bounded. Sliding layers keep only the last
-        `sliding_window` positions (copied, so the rest is freed)."""
+    def _append(self, cache, outputs, count):
+        """Write the first `count` rows of a prefill's new K/V into the cache."""
+        start, per_layer = cache.length, 2 * self.config.num_kv_heads
+        at = start % self.ring  # a chunk divides the ring, so this never wraps
+        for index, (buffer, new) in enumerate(zip(cache.buffers, outputs, strict=True)):
+            row = at if self._sliding[index // per_layer] else start
+            buffer[row : row + count, :].inplace_copy_from(new[:count, :])
+        cache.positions[start : start + count] = np.arange(start, start + count)
+        cache.ring_positions[at : at + count] = np.arange(start, start + count)
+        cache.length += count
+
+    def prefill(self, tokens, slots=(0,), pad=0, keep=True):
+        """(cache of `tokens`, fp32 logits of `slots` after the last token), fed one static
+        chunk at a time. With `keep=False` the last chunk is not written to the cache (a
+        `direct` question only needs its logits)."""
         from max.driver import CPU
 
-        cache, logits = self.empty_cache(), None
-        window = self.config.sliding_window
+        # Allocated once for the whole prefix; each chunk only attends to a view of the filled
+        # part, in buckets of at least `min_view` rows: early chunks do not pay for the empty
+        # rows, and a request uses two or three prefill graphs, not one per doubling.
+        capacity = self._bucket(len(tokens), self.block)
+        cache = KVCache(self._layer_buffers(capacity), capacity, self.ring)
         candidates = self._host_buffer(np.array(slots, dtype=np.int64))
-        for start in range(0, len(tokens), chunk):
-            piece = tokens[start : start + chunk]
-            *cache, logits = self._prefill.execute(
-                self._host_buffer(np.array(piece, dtype=np.int64)),
-                self._buffer(np.arange(start, start + len(piece), dtype=np.int64)),
-                *self._positions(start),
+        logits = None
+        for start in range(0, len(tokens), self.chunk):
+            piece = tokens[start : start + self.chunk]
+            padded = np.full(self.chunk, pad, dtype=np.int64)
+            padded[: len(piece)] = piece
+            view = min(capacity, max(self.min_view, self._bucket(start, self.block)))
+            model = self._model("prefill", view, self.ring, self.chunk)
+            *outputs, logits = model.execute(
+                self._host_buffer(padded),
+                self._buffer(np.arange(start, start + self.chunk, dtype=np.int64)),
+                self._buffer(np.array([len(piece) - 1], dtype=np.int64)),
                 candidates,
-                *cache,
+                self._buffer(cache.positions[:view]),
+                self._buffer(cache.ring_positions),
+                *self._views(cache, view),
                 *self._weights,
             )
-            for index in self._sliding:
-                rows = cache[index].shape[0]
-                if rows > window:
-                    cache[index] = cache[index][rows - window :, :, :].copy()
+            if keep or start + self.chunk < len(tokens):
+                self._append(cache, outputs, len(piece))
         return cache, None if logits is None else logits.to(CPU()).to_numpy()[0]
 
-    def score(self, cache, prefix_length, suffixes, slots, pad):
+    def score(self, cache, suffixes, slots, pad):
         """fp32 logits [len(suffixes), len(slots)] after each suffix, all continuing `cache`."""
+        from max.driver import CPU
+
         count = len(suffixes)
         if not 1 <= count <= self.batch_size:
             raise ValueError(f"score takes 1 to {self.batch_size} suffixes")
         batch = 1 if count == 1 else self.batch_size
         rows = suffixes + [suffixes[0]] * (batch - count)  # padding rows, discarded
-        width = max(map(len, rows))
-        tokens = np.full((len(rows), width), pad, dtype=np.int64)
+        # Width bucket: batch * width must be a multiple of the block.
+        width = self._bucket(max(map(len, rows)), self.block // math.gcd(batch, self.block))
+        tokens = np.full((batch, width), pad, dtype=np.int64)
         for row, suffix in enumerate(rows):
             tokens[row, : len(suffix)] = suffix
         # Right padding is causal future context: each row reads its own last real position.
         last = np.array([r * width + len(s) - 1 for r, s in enumerate(rows)], dtype=np.int64)
-        (logits,) = self._score[batch].execute(
+        start = cache.length
+        model = self._model("score", cache.capacity, self.ring, batch, width)
+        (logits,) = model.execute(
             self._host_buffer(tokens),
-            self._buffer(np.arange(prefix_length, prefix_length + width, dtype=np.int64)),
+            self._buffer(np.arange(start, start + width, dtype=np.int64)),
             self._buffer(last),
             self._host_buffer(np.array(slots, dtype=np.int64)),
-            *self._positions(prefix_length),
-            *cache,
+            self._buffer(cache.positions),
+            self._buffer(cache.ring_positions),
+            *cache.buffers,
             *self._weights,
         )
-        from max.driver import CPU
-
         return logits.to(CPU()).to_numpy()[:count]
 
     def free_bytes(self):
@@ -271,7 +351,7 @@ class MaxBackend:
         spec = identify(config)
         weights = load_weights(sorted(path.glob("*.safetensors")))
         registry = {name: weight.data() for name, weight in weights.items()}
-        runner = SparkRunner(spark, registry, target, DType.bfloat16, batch_size)
+        runner = SparkRunner(spark, registry, target, DType.bfloat16, batch_size, prefill_chunk)
         identity = {
             "source": spec.repo,
             "requested_revision": spec.revision,
@@ -330,15 +410,14 @@ class MaxBackend:
         if not reuse:
             for job in jobs:
                 # The prefill's own last position gives the answer: one pass, no score call.
-                cache, logits = runner.prefill(job.tokens, self.prefill_chunk, job.slots)
+                _, logits = runner.prefill(job.tokens, job.slots, pad, keep=False)
                 result[job.id] = logits.tolist()
-                self._track_memory()  # while this job's K/V is still alive
+                self._track_memory()
                 evaluated_tokens += len(job.tokens)
                 batches += 1
-                del cache
         else:
             mark = time.perf_counter()
-            cache, _ = runner.prefill(prefix, self.prefill_chunk)
+            cache, _ = runner.prefill(prefix, pad=pad)
             prefix_seconds = time.perf_counter() - mark
             evaluated_tokens += len(prefix)
             ordered = sorted(jobs, key=lambda j: len(j.tokens))
@@ -346,7 +425,7 @@ class MaxBackend:
                 group = ordered[offset : offset + self.batch_size]
                 suffixes = [job.tokens[len(prefix) :] for job in group]
                 union = sorted({slot for job in group for slot in job.slots})
-                logits = runner.score(cache, len(prefix), suffixes, union, pad)
+                logits = runner.score(cache, suffixes, union, pad)
                 self._track_memory()  # prefix K/V plus this microbatch
                 for job, row in zip(group, logits, strict=True):
                     result[job.id] = [float(row[union.index(slot)]) for slot in job.slots]
