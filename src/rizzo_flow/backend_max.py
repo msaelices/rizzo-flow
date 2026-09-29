@@ -118,7 +118,7 @@ class SparkRunner:
         batch_size=4,
         chunk=512,
         block=128,
-        max_resident=4,
+        max_resident=16,
         min_view=1024,
         score_tokens=1024,
     ):
@@ -181,7 +181,7 @@ class SparkRunner:
         self._graphs = graphs
         self._session = InferenceSession(devices=[device])
         # Each compiled graph holds its own activation memory on the device: keep only the
-        # most recently used ones (the others reload from MAX's disk cache in seconds).
+        # most recently used ones (the others reload from MAX's disk cache in ~10 s).
         self._compiled = OrderedDict()
         self.max_resident = max_resident
         self._sliding = [kind == SLIDING for kind in config.layer_types]
@@ -347,7 +347,7 @@ class MaxBackend:
         self._lowest_free = None
 
     @classmethod
-    def load(cls, path, device="auto", ctx=8192, batch_size=4, prefill_chunk=512):
+    def load(cls, path, device="auto", ctx=8192, batch_size=4, prefill_chunk=512, max_resident=16):
         from max.dtype import DType
         from max.graph.weights import load_weights
 
@@ -365,7 +365,15 @@ class MaxBackend:
         spec = identify(config)
         weights = load_weights(sorted(path.glob("*.safetensors")))
         registry = {name: weight.data() for name, weight in weights.items()}
-        runner = SparkRunner(spark, registry, target, DType.bfloat16, batch_size, prefill_chunk)
+        runner = SparkRunner(
+            spark,
+            registry,
+            target,
+            DType.bfloat16,
+            batch_size,
+            prefill_chunk,
+            max_resident=max_resident,
+        )
         identity = {
             "source": spec.repo,
             "requested_revision": spec.revision,

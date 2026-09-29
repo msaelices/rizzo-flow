@@ -105,6 +105,18 @@ def main():
             help="KV cache precision (llama backend): q8_0 halves it, q4_0 quarters it; "
             "default is llama.cpp's own (f16). Use it when a long --ctx does not fit",
         )
+        p.add_argument(
+            "--prefill-chunk",
+            type=int,
+            help="Tokens per prefill call (llama, max; on MAX a multiple of 128 dividing 512). "
+            "Smaller uses less device memory",
+        )
+        p.add_argument(
+            "--max-resident",
+            type=int,
+            help="MAX backend: compiled size-bucket graphs kept loaded (default 16); each holds "
+            "device memory, evicted ones reload from MAX's disk cache in ~10 s",
+        )
         # --max-tokens is the former name, kept as an alias.
         p.add_argument(
             "--ctx",
@@ -192,6 +204,8 @@ def main():
             batch_size=args.batch_size,
             threads=args.threads,
             kv_type=args.kv_type,
+            prefill_chunk=args.prefill_chunk,
+            max_resident=args.max_resident,
         )
         calibration = Calibration.from_file(args.calibration) if args.calibration else None
         engine = Engine(backend, ctx=args.ctx, calibration=calibration)
