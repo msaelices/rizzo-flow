@@ -349,3 +349,24 @@ gli stessi 15 fra il proprio shared e il proprio direct; MAX shared e direct con
 Su richieste con molte domande MAX è alla pari con llama.cpp BF16 e più veloce di Q8_0 a 512
 token; resta più lento su una domanda sola e in `direct`, dove il prefill va a blocchi da 256
 token (512 non entra in 4 GiB con stati da 2048). Da rifare su una GPU più grande (e sul 4B).
+
+### Forme statiche per bucket e misura a caldo controllato (29 settembre, `*-cool.json`)
+
+Il portatile va in throttling (86 °C, 1035 MHz su 2100 dopo ore di carico): i run precedenti
+non sono confrontabili fra loro nel tempo (fino a ±30%). Qui i tre backend girano uno dopo
+l'altro, ciascuno partendo sotto i 65 °C, una ripetizione per cella (più il warm-up), modo
+`shared`. MAX ora usa forme statiche per bucket (cache a 128·2^k righe, grafi compilati al primo
+uso), così l'attenzione passa sui tensor core invece del fallback cuBLAS.
+
+| Stato · domande | llama.cpp BF16 | MAX BF16 | MAX/llama BF16 | llama.cpp Q8_0 | argmax diversi vs BF16 | max Δp |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 512 · 1 | 281 ms | 266 ms | 0.95 | 206 ms | 0/1 | 0.001 |
+| 512 · 8 | 616 ms | 630 ms | 1.02 | 480 ms | 0/8 | 0.012 |
+| 512 · 64 | 3.44 s | 3.42 s | 0.99 | 2.64 s | 0/64 | 0.009 |
+| 2048 · 1 | 835 ms | 819 ms | 0.98 | 616 ms | 0/1 | 0.000 |
+| 2048 · 8 | 1.33 s | 1.40 s | 1.05 | 1.02 s | 0/8 | 0.008 |
+| 2048 · 64 | 5.23 s | 5.47 s | 1.05 | 4.28 s | 6/64 | 0.017 |
+
+MAX BF16 è alla pari con llama.cpp BF16 (0.95–1.05×), ma llama.cpp Q8_0, a GPU fresca, è il più
+veloce (MAX 1.3× più lento). I 6 argmax diversi sono pareggi (margine ≤ 0.002 in llama.cpp).
+Una ripetizione: rumore da aspettarsi di qualche punto percentuale. Da rifare su GPU desktop.
