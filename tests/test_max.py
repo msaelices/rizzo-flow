@@ -155,3 +155,26 @@ def test_runner_rejects_weights_that_do_not_match_the_config(reference):
     del weights["model.norm.weight"]
     with pytest.raises(ValueError, match="lacks 1 tensors"):
         SparkRunner(spark, weights, CPU(), DType.float32)
+
+
+def test_long_suffixes_are_split_under_the_score_token_cap(reference, backend):
+    """Microbatches shrink, and a suffix alone over the cap takes the chunked prefill; the
+    logits do not change."""
+    from rizzo_flow.prompts import Compiled
+
+    prefix = [4, 5, 6, 7, 8] * 4
+    jobs = [
+        Compiled(str(i), prefix + [9, 10, 11] * n, SLOTS, "test") for i, n in enumerate([1, 7, 3])
+    ]
+    backend.runner.score_tokens, cap = 24, backend.runner.score_tokens
+    try:
+        groups, alone = backend._groups(sorted(jobs, key=lambda j: len(j.tokens)), len(prefix))
+        assert [j.id for j in alone] == ["1"] and [[j.id for j in g] for g in groups] == [
+            ["0"],
+            ["2"],
+        ]
+        result, _ = backend.score(prefix, jobs, "shared")
+    finally:
+        backend.runner.score_tokens = cap
+    for job in jobs:
+        assert result[job.id] == pytest.approx(mlx_logits(reference[1], job.tokens), abs=2e-4)

@@ -120,6 +120,7 @@ class SparkRunner:
         block=128,
         max_resident=4,
         min_view=1024,
+        score_tokens=1024,
     ):
         from max.driver import CPU, Buffer
         from max.dtype import DType
@@ -170,6 +171,10 @@ class SparkRunner:
             )
         self.chunk = chunk
         self.min_view = min_view
+        # Score attention is quadratic in rows * width (every row's new tokens are keys for all
+        # rows, block-masked): a microbatch of 4 suffixes of ~1.3k tokens needs ~2 GB. Calls are
+        # capped at this many tokens; `fits` tells the backend when to split.
+        self.score_tokens = score_tokens
         # Score graphs have a static batch: one row for a lone suffix, `batch_size` rows for
         # microbatches, smaller groups padded with copies.
         self.batch_size = batch_size
@@ -282,6 +287,17 @@ class SparkRunner:
                 self._append(cache, outputs, len(piece))
         return cache, None if logits is None else logits.to(CPU()).to_numpy()[0]
 
+    def _shape(self, count, longest):
+        """(rows, width bucket) of the score graph for `count` suffixes: one row alone, else a
+        full `batch_size` microbatch; rows * width must be a multiple of the block."""
+        batch = 1 if count == 1 else self.batch_size
+        return batch, self._bucket(longest, self.block // math.gcd(batch, self.block))
+
+    def fits(self, count, longest):
+        """Whether `count` suffixes, the longest `longest` tokens, fit one score call."""
+        batch, width = self._shape(count, longest)
+        return batch * width <= self.score_tokens
+
     def score(self, cache, suffixes, slots, pad):
         """fp32 logits [len(suffixes), len(slots)] after each suffix, all continuing `cache`."""
         from max.driver import CPU
@@ -289,10 +305,8 @@ class SparkRunner:
         count = len(suffixes)
         if not 1 <= count <= self.batch_size:
             raise ValueError(f"score takes 1 to {self.batch_size} suffixes")
-        batch = 1 if count == 1 else self.batch_size
+        batch, width = self._shape(count, max(map(len, suffixes)))
         rows = suffixes + [suffixes[0]] * (batch - count)  # padding rows, discarded
-        # Width bucket: batch * width must be a multiple of the block.
-        width = self._bucket(max(map(len, rows)), self.block // math.gcd(batch, self.block))
         tokens = np.full((batch, width), pad, dtype=np.int64)
         for row, suffix in enumerate(rows):
             tokens[row, : len(suffix)] = suffix
@@ -387,6 +401,25 @@ class MaxBackend:
             return None
         return max(self._idle_free - self._lowest_free, 0)
 
+    def _groups(self, ordered, prefix_length):
+        """Microbatches of up to `batch_size` suffixes within the runner's token cap, and the
+        jobs whose suffix alone exceeds it."""
+        groups, alone, group = [], [], []
+        for job in ordered:
+            length = len(job.tokens) - prefix_length
+            if not self.runner.fits(1, length):
+                alone.append(job)
+                continue
+            if group and (
+                len(group) == self.batch_size or not self.runner.fits(len(group) + 1, length)
+            ):
+                groups.append(group)
+                group = []
+            group.append(job)
+        if group:
+            groups.append(group)
+        return groups, alone
+
     def score(self, prefix: list[int], jobs: list[Compiled], mode="shared"):
         if mode not in ("shared", "direct"):
             raise ValueError("Unknown execution mode")
@@ -420,9 +453,15 @@ class MaxBackend:
             cache, _ = runner.prefill(prefix, pad=pad)
             prefix_seconds = time.perf_counter() - mark
             evaluated_tokens += len(prefix)
-            ordered = sorted(jobs, key=lambda j: len(j.tokens))
-            for offset in range(0, len(ordered), self.batch_size):
-                group = ordered[offset : offset + self.batch_size]
+            groups, alone = self._groups(sorted(jobs, key=lambda j: len(j.tokens)), len(prefix))
+            for job in alone:
+                # A suffix too long for one score call: the chunked prefill bounds its memory.
+                _, logits = runner.prefill(job.tokens, job.slots, pad, keep=False)
+                result[job.id] = logits.tolist()
+                self._track_memory()
+                evaluated_tokens += len(job.tokens)
+                batches += 1
+            for group in groups:
                 suffixes = [job.tokens[len(prefix) :] for job in group]
                 union = sorted({slot for job in group for slot in job.slots})
                 logits = runner.score(cache, suffixes, union, pad)
